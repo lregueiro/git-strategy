@@ -261,25 +261,180 @@ update_git_config() {
 push_to_remote() {
     print_step "Pushing changes to remote..."
     
-    if git remote | grep -q origin && [ "$DRY_RUN" = false ]; then
-        print_status "Pushing all branches and tags to origin..."
-        
-        # Push main branches
-        git push origin main 2>/dev/null || print_warning "Could not push main"
-        git push origin develop 2>/dev/null || print_warning "Could not push develop"
-        git push origin season/next 2>/dev/null || print_warning "Could not push season/next"
-        
-        # Push archive branch
-        git push origin "season/previous-${CURRENT_YEAR}" 2>/dev/null || print_warning "Could not push archive branch"
-        
-        # Push all tags
-        git push --tags 2>/dev/null || print_warning "Could not push tags"
-        
-        print_success "Changes pushed to origin"
-    elif [ "$DRY_RUN" = true ]; then
-        print_dry_run "Push all branches and tags to origin"
-    else
+    if ! git remote | grep -q origin; then
         print_warning "No remote 'origin' found. Skipping push to remote."
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        print_dry_run "Push all branches and tags to origin"
+        return 0
+    fi
+    
+    print_status "Pushing all branches and tags to origin..."
+    
+    # Function to safely push a branch with detailed error handling and force push support
+    safe_push_branch() {
+        local branch="$1"
+        local allow_force_push="${2:-false}"  # Second parameter to allow force push
+        local current_branch=$(git branch --show-current)
+        
+        # Check if branch exists locally
+        if ! branch_exists "$branch"; then
+            print_warning "Branch '$branch' does not exist locally, skipping push"
+            return 0
+        fi
+        
+        # Switch to branch if not already on it
+        if [ "$current_branch" != "$branch" ]; then
+            if ! git checkout "$branch" > /dev/null 2>&1; then
+                print_warning "Could not checkout branch '$branch', skipping push"
+                return 0
+            fi
+        fi
+        
+        # Check if remote branch exists and compare
+        local needs_force_push=false
+        if git ls-remote --exit-code --heads origin "$branch" > /dev/null 2>&1; then
+            # Remote branch exists, check if we're ahead, behind, or diverged
+            git fetch origin "$branch" > /dev/null 2>&1 || {
+                print_warning "Could not fetch origin/$branch for comparison"
+            }
+            
+            local ahead=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "unknown")
+            local behind=$(git rev-list --count "$branch..origin/$branch" 2>/dev/null || echo "unknown")
+            
+            if [ "$ahead" = "0" ] && [ "$behind" = "0" ]; then
+                print_status "Branch '$branch' is up to date with origin"
+                return 0
+            elif [ "$behind" != "0" ] && [ "$behind" != "unknown" ]; then
+                print_status "Branch '$branch' has diverged from origin/$branch (ahead: $ahead, behind: $behind)"
+                if [ "$allow_force_push" = "true" ]; then
+                    needs_force_push=true
+                    print_status "Will use force push due to season transition"
+                else
+                    print_warning "Branch '$branch' is behind origin/$branch by $behind commits"
+                fi
+            elif [ "$ahead" != "unknown" ] && [ "$ahead" != "0" ]; then
+                print_status "Branch '$branch' is ahead by $ahead commits"
+            fi
+        else
+            print_status "Remote branch 'origin/$branch' does not exist, will create it"
+        fi
+        
+        # Attempt to push with detailed error reporting
+        local push_command="git push origin $branch"
+        local push_description="Pushing branch '$branch'"
+        
+        if [ "$needs_force_push" = "true" ]; then
+            push_command="git push --force-with-lease origin $branch"
+            push_description="Force pushing branch '$branch' (season transition)"
+        fi
+        
+        print_status "$push_description..."
+        local push_output
+        local push_exit_code
+        
+        push_output=$(eval "$push_command" 2>&1)
+        push_exit_code=$?
+        
+        if [ $push_exit_code -eq 0 ]; then
+            print_success "Successfully pushed '$branch' to origin"
+        else
+            # If normal push failed and force push is allowed, try force push
+            if [ "$needs_force_push" = "false" ] && [ "$allow_force_push" = "true" ]; then
+                if echo "$push_output" | grep -q -E "(rejected.*non-fast-forward|rejected.*fetch first)"; then
+                    print_status "Normal push failed due to divergence, attempting force push..."
+                    push_output=$(git push --force-with-lease origin "$branch" 2>&1)
+                    push_exit_code=$?
+                    
+                    if [ $push_exit_code -eq 0 ]; then
+                        print_success "Successfully force pushed '$branch' to origin"
+                        return 0
+                    else
+                        print_warning "Force push also failed for '$branch'"
+                    fi
+                fi
+            fi
+            
+            print_warning "Failed to push '$branch' to origin (exit code: $push_exit_code)"
+            
+            # Provide specific error messages based on common failure patterns
+            if echo "$push_output" | grep -q "rejected.*non-fast-forward"; then
+                print_warning "Push rejected: '$branch' has diverged from origin."
+                if [ "$allow_force_push" = "true" ]; then
+                    print_status "This is expected during season transition - branch histories were rewritten"
+                else
+                    print_status "Consider using force push or merge to resolve"
+                fi
+            elif echo "$push_output" | grep -q "rejected.*fetch first"; then
+                print_warning "Push rejected: Remote '$branch' has updates."
+            elif echo "$push_output" | grep -q "stale info"; then
+                print_warning "Force push failed: Someone else updated the branch. Try again or use regular force push."
+            elif echo "$push_output" | grep -q "Authentication failed"; then
+                print_warning "Push failed: Authentication issue with remote repository."
+            elif echo "$push_output" | grep -q "Permission denied"; then
+                print_warning "Push failed: Permission denied. Check your repository access rights."
+            else
+                print_warning "Push error details: $push_output"
+            fi
+            
+            return $push_exit_code
+        fi
+    }
+    
+    # Function to safely push tags with error handling
+    safe_push_tags() {
+        print_status "Pushing tags..."
+        local push_output
+        local push_exit_code
+        
+        push_output=$(git push --tags origin 2>&1)
+        push_exit_code=$?
+        
+        if [ $push_exit_code -eq 0 ]; then
+            print_success "Successfully pushed tags to origin"
+        else
+            print_warning "Failed to push tags to origin (exit code: $push_exit_code)"
+            if echo "$push_output" | grep -q "already exists"; then
+                print_status "Some tags may already exist on remote, this is usually not an issue"
+            else
+                print_warning "Tag push error details: $push_output"
+            fi
+            return $push_exit_code
+        fi
+    }
+    
+    # Store current branch to restore later
+    local original_branch=$(git branch --show-current)
+    local push_failures=0
+    
+    # Push main branches with error counting - use force push for main and develop due to season transition
+    safe_push_branch "main" "true" || ((push_failures++))
+    safe_push_branch "develop" "true" || ((push_failures++))
+    safe_push_branch "season/next" "false" || ((push_failures++))
+    
+    # Push archive branch if it was created - allow force push for archive branches too
+    local archive_branch="season/previous-${CURRENT_YEAR}"
+    if branch_exists "$archive_branch"; then
+        safe_push_branch "$archive_branch" "true" || ((push_failures++))
+    fi
+    
+    # Push all tags
+    safe_push_tags || ((push_failures++))
+    
+    # Return to original branch
+    if [ "$original_branch" != "$(git branch --show-current)" ]; then
+        if ! git checkout "$original_branch" > /dev/null 2>&1; then
+            print_warning "Could not return to original branch '$original_branch'"
+        fi
+    fi
+    
+    if [ $push_failures -eq 0 ]; then
+        print_success "All remote push operations completed successfully"
+    else
+        print_warning "Remote push completed with $push_failures failures - check warnings above"
+        print_status "The transition can still be considered successful, but you may need to manually resolve remote issues"
     fi
 }
 
