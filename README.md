@@ -1,6 +1,6 @@
 # Seasonal Project
 
-This project uses a seasonal GitFlow branching strategy.
+This project uses a seasonal GitFlow branching strategy. Changes from season/next
 
 ## Branches
 - `main` - Current season production
